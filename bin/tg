@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# tg — tgrep with its two safety conditions enforced in code.
+#
+# tgrep (github.com/microsoft/tgrep) is a trigram-indexed grep: fast, and — apart from
+# three known deviations documented in the README — it returns the same results ripgrep
+# does. But it has two failure modes that return ZERO results while saying nothing
+# useful, and they exit 1, which makes them indistinguishable from a genuine no-match:
+#
+#   1. Server down + stale on-disk index. It does not see files created or modified
+#      since the last `tgrep index`. It prints "Server unreachable" on stderr, but the
+#      empty result looks exactly like a real one.
+#
+#   2. Cold start. For roughly a second after the server comes up, it answers from an
+#      EMPTY index. There is no "Server unreachable" to detect: the server is healthy
+#      and responding. This is the dangerous one, and it is the one no written rule can
+#      ever catch — it happens before anyone gets a chance to remember anything.
+#
+# This wrapper closes both: it waits for `tgrep status` to report `Indexing: complete`
+# before the first search, and if stderr carries "Server unreachable" it retries with
+# --no-index (full scan, always correct).
+#
+# The index lives in a central per-root cache rather than inside the repo, so it never
+# pollutes anyone's tree. And because this wrapper is the ONLY thing that starts the
+# server and the ONLY thing that searches, client and server always agree on
+# --index-path. That agreement removes an entire class of bug: "the server indexed
+# something other than what you are searching".
+#
+# Environment:
+#   TG_ROOT=/path     root to index (default: the git repo root, else the cwd)
+#   TG_NO_SERVE=1     do not start a server; fall back to a full scan
+#   TGREP_BIN=/path   which tgrep binary to use
+#   TG_GATE_SECS=30   how long to wait for the index to become trustworthy
+
+set -uo pipefail
+
+TGREP="${TGREP_BIN:-tgrep}"
+command -v "$TGREP" >/dev/null 2>&1 || {
+  printf 'tg: cannot find tgrep (%s). Install it or export TGREP_BIN.\n' "$TGREP" >&2
+  exit 127
+}
+
+# The root decides which index is used. A git toplevel is the natural boundary of a
+# project; outside a repo, the cwd. It never walks further up on its own.
+if [ -n "${TG_ROOT:-}" ]; then
+  ROOT="$TG_ROOT"
+else
+  ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || ROOT=""
+  [ -n "$ROOT" ] || ROOT="$PWD"
+fi
+
+# One index per root, in the user's cache. The hash is of the absolute path, so two
+# repos sharing a basename do not share an index.
+_hash() {
+  if command -v shasum >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 256 | cut -c1-16
+  else printf '%s' "$1" | sha256sum | cut -c1-16; fi
+}
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tgrep-safe"
+IDX="$CACHE/$(_hash "$ROOT")"
+mkdir -p "$CACHE" 2>/dev/null || true
+
+_indexing_complete() {
+  "$TGREP" status "$ROOT" --index-path "$IDX" 2>/dev/null | grep -q 'Indexing: *complete'
+}
+_server_up() {
+  "$TGREP" status "$ROOT" --index-path "$IDX" 2>/dev/null | grep -q 'PID:'
+}
+
+if [ -z "${TG_NO_SERVE:-}" ]; then
+  # `_server_up || nohup ... &` does NOT work: the `&` binds to the WHOLE `||` list, so
+  # the check gets backgrounded too and the subshell inherits tg's stdout. Inside a
+  # command substitution — `x=$(tg foo .)`, which is how half of all callers use this —
+  # `$( )` waits for the write end of the pipe to close, and the subshell holds it open
+  # forever. The call hangs. Measured.
+  #
+  # With the `if` in the foreground and only the server backgrounded, all three file
+  # descriptors redirected, the pipe is released and tg returns.
+  if ! _server_up; then
+    nohup "$TGREP" serve "$ROOT" --index-path "$IDX" >/dev/null 2>&1 </dev/null &
+    disown 2>/dev/null || true
+  fi
+
+  # ── Condition 2: the gate. Without it, a search in the first second returns zero and
+  #    looks like there is nothing there. Measured: 0 results at 0.2s and 0.5s; the
+  #    correct 116 only from 1s onward.
+  gate_max="${TG_GATE_SECS:-30}"
+  waited=0
+  limit=$(( gate_max * 10 ))
+  while [ "$waited" -lt "$limit" ]; do
+    _indexing_complete && break
+    sleep 0.1
+    waited=$(( waited + 1 ))
+  done
+  if [ "$waited" -ge "$limit" ]; then
+    printf 'tg: index not ready after %ss -> falling back to --no-index (correct but slow)\n' "$gate_max" >&2
+    exec "$TGREP" --no-index "$@"
+  fi
+fi
+
+err="$(mktemp "${TMPDIR:-/tmp}/tg-err.XXXXXX")"
+trap 'rm -f "$err"' EXIT
+
+"$TGREP" "$@" --index-path "$IDX" 2>"$err"
+rc=$?
+
+# ── Condition 1: the parachute. If the server did not answer, the on-disk index may be
+#    stale and an empty result is not trustworthy. Redo it without the index.
+if grep -q 'Server unreachable' "$err"; then
+  printf 'tg: server down, on-disk index may be stale -> retrying with --no-index\n' >&2
+  exec "$TGREP" --no-index "$@"
+fi
+
+# Every other tgrep warning passes through untouched: a PCRE2 backtracking abort comes
+# out here, with its exit 2, and the user needs to see it.
+grep -v 'Server unreachable' "$err" >&2 || true
+exit $rc
